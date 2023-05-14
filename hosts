@@ -1,4 +1,4 @@
 [web]
-192.168.9.171 ansible_user=vagrant 
+192.168.1.98 ansible_user=vagrant 
 [db]
-192.168.9.172 ansible_user=vagrant 
+192.168.1.99 ansible_user=vagrant 

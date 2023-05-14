@@ -6,7 +6,7 @@
   vars_files: vars/main.yml
 
   tasks:
-  - name: install apache and php last version
+  - name: install apache and php last version for Debian os family
     apt:
       name:
         - apache2
@@ -14,6 +14,33 @@
         - php-mysql
       state: present
       update_cache: yes
+    when: ansible_facts['os_family'] == "Debian"
+
+  - name: install extra packages (Debian os family)
+    apt:
+      name: "{{ extra_packages_debian }}"
+      state: present
+    when: ansible_facts['os_family'] == "Debian"
+
+  #- name: install repo Epel-release for Debian os family
+  # yum:
+  #    name:
+  #     - epel-release
+  #    state: latest
+  # when: ansible_facts['os_family'] == "Redhat" 
+
+  - name: install apache and php last version for Redhat os family 
+    ansible.builtin.yum:
+      name: ['httpd', 'php', 'php-mysqlnd']
+      state: present
+      update_cache: yes
+    when: ansible_facts['os_family'] == "Redhat"
+
+  - name: install extra packages (RedHat os family)
+    yum:
+      name: "{{ extra_packages_redhat }}"
+      state: present
+    when: ansible_facts['os_family'] == "RedHat"
 
   - name: Give writable mode to http folder
     file:
@@ -36,12 +63,23 @@
       src: "db-config.php.j2"
       dest: "/var/www/html/db-config.php"
   
-  - name: ensure apache service is start
+  - name: ensure apache service is start (Debian os family)
     service:
       name: apache2
       state: started
       enabled: yes
+    when: ansible_facts['os_family'] == "Debian"
+  
+  - name: ensure apache service is start (RedHat os family) 
+    service:
+      name: httpd
+      state: started
+      enabled: yes
+    when: ansible_facts['os_family'] == "RedHat"
 
+  - name: enable connection with remote database (RedHat os family)
+    shell: setsebool -P httpd_can_network_connect_db 1
+    when: ansible_facts['os_family'] == "RedHat"
 
 # DATABASE SERVER
 
@@ -52,53 +90,77 @@
     root_password: "my_secret_password"
 
   tasks:
-  - name: install mysql
-    apt:
-      name: 
-        - mysql-server
-        - python-mysqldb # for mysql_db and mysql_user modules
+  - name: Sed change the baseurl for CentOS SCL (CentOS8)
+    ansible.builtin.shell: |
+      sed -i 's/mirrorlist/#mirrorlist/g' /etc/yum.repos.d/CentOS-*.repo
+      sed -i 's|#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g' /etc/yum.repos.d/CentOS-*.repo
+     
+  - name: Update DNF Package repository cache
+    dnf:
+      update_cache: yes
+
+  - name: Install MySQL server on CentOS 
+    dnf:
+      name: mysql-server
       state: present
-      update_cache: yes  
+    when: ansible_facts['os_family'] == "RedHat" 
 
-  - name: Create MySQL client config
-    copy:
-      dest: "/root/.my.cnf"
-      content: |
-        [client]
-        user=root
-        password={{ root_password }}
-      mode: 0400
+  - name: Install MySQL client on CentOS 
+    dnf:
+      name: mysql
+      state: present
+    when: ansible_facts['os_family'] == "RedHat"
 
-  - name: Allow external MySQL connections (1/2)
-    lineinfile:
-      path: /etc/mysql/mysql.conf.d/mysqld.cnf
-      regexp: '^skip-external-locking'
-      line: "# skip-external-locking"
+  - name: ensure mysqld service is start (RedHat os family)
+    service:
+      name: mysqld
+      state: started
+      enabled: yes
+    when: ansible_facts['os_family'] == "RedHat"
+
+  - name: Install python3-PyMySQL library
+    dnf:
+      name: python3-PyMySQL
+      state: present
+    when: ansible_facts['os_family'] == "RedHat"
+
+  - name: Register temporary password (RedHat os family)
+    shell: "grep 'temporary password' /var/log/mysqld.log  | awk '{print $(NF)}'"
+    register: password_tmp
+    when: ansible_facts['os_family'] == "RedHat"   
+
+  - name: Set default root user password (RedHat os family)
+    set_fact:
+      default_root_password: '{{ password_tmp.stdout }}'
+    when: ansible_facts['os_family'] == "RedHat"
+
+  - name: change mysql config (RedHat os only)
+    blockinfile:
+      path: /etc/my.cnf
+      insertafter: EOF
+      block: |
+        default_authentication_plugin=mysql_native_password
+        bind-address=0.0.0.0
+        default_password_lifetime=0
+        validate_password_policy=LOW
+        validate_password_length=6
+        validate_password_number_count=0
+    when: ansible_facts['os_family'] == "RedHat" 
     notify: Restart mysql
 
-  - name: Allow external MySQL connections (2/2)
-    lineinfile:
-      path: /etc/mysql/mysql.conf.d/mysqld.cnf
-      regexp: '^bind-address'
-      line: "# bind-address"
-    notify: Restart mysql
+  - name: Change root SQL password and GRANT root privileges (RedHat os family)
+    command: "mysql --user=root --password={{ default_root_password }} --connect-expired-password   --execute=\"ALTER USER 'root'@'localhost' IDENTIFIED BY '{{ root_password }}'; grant all privileges on *.* to 'root'@'localhost' with grant option;\""
+    ignore_errors: yes # ignore errors because we only change mysql root password once
+    when: ansible_facts['os_family'] == "RedHat"
 
+  # create root .my.cnf config file
+  - name: Add .my.cnf
+    template: src=my.cnf.j2 dest=/root/.my.cnf owner=root group=root mode=0600
+ 
   - name: upload sql table config
     template:
       src: "table.sql.j2"
       dest: "/tmp/table.sql"
-
-  - name: Install MySQL-python
-    apt:
-      name:
-        - python3-pip
-      state: latest
-
-  - name: Install mysql python driver for root
-    pip:
-      name: 
-        - pymysql
-      state: present
 
   - name: add sql table to database
     mysql_db:
@@ -108,8 +170,8 @@
       login_password: '{{ root_password }}'
       state: import 
       target: /tmp/table.sql
-      login_unix_socket: /var/run/mysqld/mysqld.sock
-
+      #login_unix_socket: /var/run/mysqld/mysqld.sock
+      
   - name: "Create {{ mysql_user }} with all {{ mysql_dbname }} privileges"
     mysql_user:
       name: "{{ mysql_user }}"
@@ -120,11 +182,10 @@
       state: present
       login_user: root
       login_password: '{{ root_password }}'
-      login_unix_socket: /var/run/mysqld/mysqld.sock
+      #login_unix_socket: /var/run/mysqld/mysqld.sock
 
   handlers:
     - name: Restart mysql
       service:
-        name: mysql
+        name: mysqld
         state: restarted
-
